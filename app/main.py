@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException
 from .models import (
     AdmitRequest,
     AdmitResponse,
+    BudgetSplitRequest,
+    BudgetSplitResponse,
     FareEnvelopeRequest,
     FareEnvelopeResponse,
     FareEnvelopeWitness,
@@ -32,6 +34,7 @@ from .models import (
 )
 from .splitter import (
     admit_passengers,
+    budget_split,
     fare_envelope as compute_fare_envelope,
     plan_seats,
     reconcile_receipts,
@@ -43,7 +46,7 @@ from .splitter import (
 
 app = FastAPI(
     title="Carpool Fare Splitter",
-    version="1.3.0",
+    version="1.4.0",
     summary="Split a carpool trip's per-segment costs fairly between passengers.",
 )
 
@@ -70,6 +73,42 @@ def split(request: SplitRequest) -> SplitResponse:
     return SplitResponse(
         total_cost=sum(request.segments),
         totals={str(pid): amount for pid, amount in totals.items()},
+        segments=[
+            SegmentSplit(
+                index=d["index"],
+                cost=d["cost"],
+                passengers=d["passengers"],
+                shares={str(pid): amount for pid, amount in d["shares"].items()},
+            )
+            for d in details
+        ],
+    )
+
+
+@app.post(
+    "/budget-split",
+    response_model=BudgetSplitResponse,
+    responses={422: {"description": "Invalid trip or request (bad interval, "
+                                     "out-of-range station, duplicate id, "
+                                     "empty-load charged segment, missing or "
+                                     "illegal budget cap, malformed payload), "
+                                     "or no feasible integer reallocation "
+                                     "exists under the per-passenger caps"}},
+)
+def budget_fares(request: BudgetSplitRequest) -> BudgetSplitResponse:
+    baseline, _ = split_fares(request.segments, request.passengers)
+    try:
+        totals, details = budget_split(request.segments, request.passengers)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    deviation = sum(
+        abs(totals[pid] - baseline[pid]) for pid in totals
+    )
+    return BudgetSplitResponse(
+        total_cost=sum(request.segments),
+        baseline_totals={str(pid): amount for pid, amount in baseline.items()},
+        totals={str(pid): amount for pid, amount in totals.items()},
+        deviation=deviation,
         segments=[
             SegmentSplit(
                 index=d["index"],

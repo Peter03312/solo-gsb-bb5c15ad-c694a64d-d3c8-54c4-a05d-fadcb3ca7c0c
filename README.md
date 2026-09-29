@@ -13,7 +13,11 @@
 区间重叠者不可同座、下车站可立即换客，多方案时取规范编号顺序下座位编号序列字典序最小者，
 无解返回 409）；还可在录入行程时只有逐路段在车人数、每位乘客仅剩若干候选上下车区间的情况下，
 **还原完整乘车名单**（每人恰选一个候选 `[board, alight)` 区间使各段覆盖人数精确吻合，
-多解时取规范 ID 顺序下区间序列字典序最小者），并直接给出同一套逐段分摊结果。
+多解时取规范 ID 顺序下区间序列字典序最小者），并直接给出同一套逐段分摊结果；
+本轮新增**预算上限下的整数费用重分配**：给出每位乘客全程可承担上限 `max_fare`，
+在「逐段费用守恒、只向该段在车乘客收费、每人累计不超过上限」的可行整数分配中，
+以现有逐段均摊结果为基准最小化各乘客累计费用与基准的绝对偏差之和，
+再按规范乘客 ID 与逐段金额的字典序择优，不可行时返回 422。
 金额全程使用整数分与精确分数计算，总额严格守恒，且乘客、凭证与付款记录的输入顺序不影响结果。
 
 ## 快速启动
@@ -29,6 +33,7 @@ docker compose up --build
 | 地址 | 说明 |
 | --- | --- |
 | http://localhost:8000/split | 分摊接口（POST） |
+| http://localhost:8000/budget-split | 预算上限下的整数费用重分配接口（POST，不可行返回 422） |
 | http://localhost:8000/admit | 候选乘客遴选 + 分摊接口（POST） |
 | http://localhost:8000/settle | 分摊 + 结清转账接口（POST） |
 | http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
@@ -39,7 +44,7 @@ docker compose up --build
 | http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
 
-以上 `/split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan`、`/roster-reconstruct` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
+以上 `/split`、`/budget-split`、`/admit`、`/settle`、`/revision-impact`、`/fare-envelope`、`/receipt-reconcile`、`/seat-plan`、`/roster-reconstruct` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -91,6 +96,112 @@ docker compose up --build
 curl -s http://localhost:8000/split \
   -H 'Content-Type: application/json' \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}]}'
+```
+
+## API：`POST /budget-split`
+
+每位乘客除 `id`、`board`、`alight` 外再给出**全程可承担上限** `max_fare`（非负整数分）。
+接口在以下三条硬约束下寻找一组**整数分**分配：
+
+1. **逐段费用守恒**：每段分给各在车乘客的金额之和恰好等于该段费用；
+2. **只向在车乘客收费**：不在某段车上的乘客在该段金额恒为 0；
+3. **每人累计不超过上限**：每名乘客全程被收金额之和不超过其 `max_fare`。
+
+以对同一行程调用 `/split`（逐段累计欠额均摊）的每人累计额作为**基准**。在所有可行分配中，
+先最小化**各乘客累计费用与基准的绝对偏差之和**
+
+```
+deviation = Σ_p |累计费用_p − 基准额_p|
+```
+
+（由于所有方案的累计额总和都等于行程总额，低于基准者的少付总额等于高于基准者的多付总额，
+偏差恒为偶数，等于「超出基准部分总额」的两倍）；偏差相同时，按以下字典序取最小方案：
+
+- 乘客按**规范 ID 顺序**排列（整数 ID 按数值升序、整体排在字符串 ID 前，字符串按字典序）；
+- 每位乘客依次取其**按行程顺序的逐段金额**（未乘坐的路段固定为 0，不参与比较）；
+- 将上述「乘客主序、段次序」的金额序列作为字典序，取最小者。
+
+因此乘客在请求中的排列顺序不影响结果。行程本身仍须满足 `/split` 的全部规则
+（区间合法、无空载收费路段等）；规模为 **1～100 段、1～12 名乘客**。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 251, 80],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3, "max_fare": 220},
+    {"id": "bob",   "board": 1, "alight": 3, "max_fare": 130},
+    {"id": "carol", "board": 0, "alight": 1, "max_fare": 81}
+  ]
+}
+```
+
+- `passengers[].max_fare`：非负整数分，该乘客**全程累计**收费的硬上限。
+- 其余字段与 `/split` 完全一致。
+
+### 响应（200）
+
+```json
+{
+  "total_cost": 431,
+  "baseline_totals": {"alice": 216, "bob": 165, "carol": 50},
+  "totals": {"alice": 220, "bob": 130, "carol": 81},
+  "deviation": 70,
+  "segments": [
+    {"index": 0, "cost": 100, "passengers": ["alice", "carol"], "shares": {"alice": 19, "carol": 81}},
+    {"index": 1, "cost": 251, "passengers": ["alice", "bob"],   "shares": {"alice": 121, "bob": 130}},
+    {"index": 2, "cost": 80,  "passengers": ["alice", "bob"],   "shares": {"alice": 80, "bob": 0}}
+  ]
+}
+```
+
+- `baseline_totals`：普通 `/split` 规则下每人应付额（偏差优化的基准），规范 ID 顺序。
+- `totals`：重分配后每人累计收费，均不超过其 `max_fare`，总和恒等于 `total_cost`。
+- `deviation`：本方案的绝对偏差之和；上例中基准为 216/165/50，bob 少付 35，
+  alice 多付 4、carol 多付 31，偏差 = 35 + 4 + 31 = 70，为全部可行方案中的最小值。
+- `segments[]`：逐段明细，结构与 `/split` 一致；每段 `shares` 之和恒等于该段费用，
+  且只含该段在车乘客。逐段金额不再受「均摊或均摊+1」限制，
+  只由全局偏差目标与字典序取舍决定（上例 bob 在第 2 段为 0、carol 在第 0 段承担 81）。
+- 当所有上限都足够宽松时，基准方案本身可行，`deviation` 为 0、`totals` 与 `/split` 一致；
+  但逐段明细仍可能在不改变每人累计额的前提下重新分布（字典序择优作用于逐段金额）。
+
+### 不可行（422）
+
+输入合法，但不存在满足三条硬约束的整数分配时返回 **422 Unprocessable Entity**，例如：
+
+- 某段在车乘客的上限之和不足以覆盖该段费用（如上例若 bob 上限 40、另一同段乘客上限 40，
+  一段 100 分的费用无处收取）；
+- 逐段看都能凑够，但跨段累计后某人的上限无法支撑其乘坐的各段费用总和
+  （流量在路段间无法调度）。
+
+区间非法、站点越界、ID 重复、空载收费段、上限为负或非整数、路段/乘客数量越界、
+字段缺失或含未知字段同样返回 422。
+
+### 算法：字典序编码 + 最小费用最大流
+
+把问题建成运输网络：源点 → 各**路段节点**（容量为该段费用）→ 该段各**在车乘客节点**
+（容量为该段费用、只允许在车者连边）→ 汇点（每名乘客的出站容量为其 `max_fare`）。
+存在价值为行程总额的整数流，当且仅当存在满足三条硬约束的分配。
+
+优化目标分两部分编码到边费上：
+
+- **偏差**：每名乘客前 `min(基准额, 上限)` 分走零费出站弧，超出基准的每一分走费用为
+  `B^L` 的弧（`B = 总额+1`，`L` 为在车「乘客×路段」位置总数）。于是最小化总费用的
+  最高位即最小化「超出基准总额」，也就是最小化偏差。
+- **字典序**：乘客主序、段次序的第 k 个位置，其「路段→乘客」边每分加收 `B^(L-1-k)`。
+  由于任一位置之后所有低位的数字之和（每位至多为总额）都严格小于该位的一个单位，
+  这构成严格的位权编码：最高位优化偏差之后，费用的低位依次按字典序最小化每个位置的金额。
+
+网络初始边费均非负，用带势能的连续最短路（Dijkstra + reduced cost）逐次增广求最小费用
+最大流，全程精确大整数运算；100 段 × 12 人的规模在 1 秒内完成。增广不到行程总额即判定不可行。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/budget-split \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3,"max_fare":220},{"id":"bob","board":1,"alight":3,"max_fare":130},{"id":"carol","board":0,"alight":1,"max_fare":81}]}'
 ```
 
 ## API：`POST /admit`
@@ -687,6 +798,9 @@ curl -s http://localhost:8000/roster-reconstruct \
 - 空载收费路段：某段 `cost > 0` 但无任何乘客在车（费用为 0 的空载段允许）；
 - 非法区间：`board >= alight`、站点越界（`alight > 路段数`）或站点为负；
 - 乘客 ID 重复、费用为负、路段列表为空、字段类型错误或含未知字段；
+- （仅 `/budget-split`）乘客为空或超过 12 名、路段超过 100 段，或 `max_fare` 为负/非整数；
+- （仅 `/budget-split`）不存在「逐段守恒、只向在车乘客收费、每人累计不超过上限」的
+  整数费用分配（某段在车乘客上限之和不足，或跨段累计后流量无法调度）；
 - （仅 `/admit`）候选超过 12 名、候选 ID 与既有乘客或其他候选重复；
 - （仅 `/admit`）既有乘客在某路段的人数已超过 `capacity`；
 - （仅 `/admit`）`capacity` 非正整数，或 `max_fare` 为负/非整数；
@@ -734,9 +848,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、/roster-reconstruct、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/budget-split、/admit、/settle、/revision-impact、/fare-envelope、/receipt-reconcile、/seat-plan、/roster-reconstruct、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位编排（贪心 + 记忆化可行性回溯）+ 名单还原（基数约束传播 + MRV 记忆化回溯）
+  splitter.py   # 核心算法：分摊（精确分数）+ 预算重分配（位权编码最小费用最大流）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）+ 费用包络（余数周期压缩）+ 凭证核销（从左到右子集 DP）+ 座位编排（贪心 + 记忆化可行性回溯）+ 名单还原（基数约束传播 + MRV 记忆化回溯）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

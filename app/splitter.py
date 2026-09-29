@@ -8,6 +8,7 @@ fractions.
 
 from __future__ import annotations
 
+import heapq
 from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
@@ -1180,3 +1181,193 @@ def reconstruct_roster(segment_costs: List[int], loads: List[int], passengers):
     ]
     totals, details = split_fares(segment_costs, rides)
     return rides, totals, details
+
+
+# --- budget split: integer fare reallocation under per-passenger caps
+
+
+def budget_split(segment_costs: List[int], passengers):
+    """Reallocate integer segment fares under per-passenger budget caps.
+
+    Each ``passengers`` item exposes ``id``, ``board``, ``alight`` and
+    ``max_fare`` (a non-negative integer-cent cap). A reallocation assigns,
+    for every segment, non-negative integer cents to each passenger on
+    board during that segment such that:
+
+    * each segment's shares sum to exactly its cost (per-segment
+      conservation);
+    * only passengers on board a segment are charged on it;
+    * each passenger's accumulated charges never exceed their ``max_fare``.
+
+    The baseline is the plain :func:`split_fares` result for the same trip.
+    Among all feasible reallocations the objective is the minimum sum over
+    passengers of ``|cumulative charge - baseline total|``. Since totals
+    always sum to the same trip cost, that minimum is exactly twice the
+    minimum total *overshoot* past the baselines (passengers below
+    baseline and above it must balance), which is cheap to model: each
+    passenger receives ``baseline`` cents for free (up to their cap) and
+    every further cent costs one.
+
+    The remaining tie is broken lexicographically: passengers in canonical
+    :func:`tie_key` order, and for each passenger the per-segment amounts
+    over travel order (zero for segments they did not ride — those entries
+    never vary), the whole flattened amount sequence compared
+    lexicographically is minimized. The tie-break is folded into the same
+    min-cost flow as the primary objective: writing ``L`` for the number of
+    on-board (passenger, segment) positions and ``B = total_cost + 1``, the
+    segment -> passenger edge for flattening position ``k`` carries an extra
+    cost of ``B ** (L - 1 - k)``; these weights form a strict place-value
+    code (every later place sums to less than one unit of the preceding
+    place), so minimizing total cost first minimizes the overshoot (whose
+    unit is ``B ** L``) and then, in order, every share amount.
+
+    The problem is a transportation network (source -> segment nodes ->
+    on-board passenger nodes -> sink), so a feasible integral flow of value
+    ``total_cost`` exists iff any reallocation does. Costs are all
+    non-negative initially; successive shortest augmenting paths with
+    reduced-cost potentials (Dijkstra) compute the min-cost max-flow
+    exactly. Raises ``ValueError`` when no feasible reallocation exists.
+
+    Returns ``(totals, details)`` in the same shape as :func:`split_fares`:
+    ``totals`` maps canonical-order passenger id -> integer cents and
+    ``details`` lists one ``{"index", "cost", "passengers", "shares"}``
+    dict per segment, with ``passengers`` in canonical id order.
+    """
+    n_segments = len(segment_costs)
+    ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+    m = len(ordered)
+    total_cost = sum(segment_costs)
+
+    baseline, _ = split_fares(segment_costs, ordered)
+    baseline_amount = [baseline[p.id] for p in ordered]
+    cap_amount = [p.max_fare for p in ordered]
+
+    # onboard[i]: passenger indices present on segment i, canonical order
+    # (ordered is already canonical, so filtering preserves that order).
+    onboard = [
+        [k for k, p in enumerate(ordered) if p.board <= i < p.alight]
+        for i in range(n_segments)
+    ]
+    # Position of each (passenger, segment) share in the passenger-major
+    # flattening: passenger k's segments come in travel order, concatenated
+    # over passengers in canonical id order. Non-ridden (k, i) pairs carry
+    # no amount and simply do not participate.
+    position: Dict[Tuple[int, int], int] = {}
+    pos = 0
+    for k in range(m):
+        for i in range(ordered[k].board, ordered[k].alight):
+            position[(k, i)] = pos
+            pos += 1
+    n_positions = pos
+    base = total_cost + 1
+    primary_unit = base ** n_positions
+
+    # Nodes: 0 source; segments 1..n_segments; passengers n_segments+1+k;
+    # sink last.
+    source = 0
+    seg_node = [1 + i for i in range(n_segments)]
+    pax_node = [1 + n_segments + k for k in range(m)]
+    sink = 1 + n_segments + m
+
+    graph: List[List[dict]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(u, v, capacity, cost):
+        graph[u].append({"to": v, "rev": len(graph[v]), "cap": capacity,
+                         "cost": cost})
+        graph[v].append({"to": u, "rev": len(graph[u]) - 1, "cap": 0,
+                         "cost": -cost})
+
+    for i, cost in enumerate(segment_costs):
+        add_edge(source, seg_node[i], cost, 0)
+
+    # The passenger-major lex code only weights segment -> passenger
+    # shares; the sink arcs decide the primary overshoot objective.
+    pair_edges: List[Tuple[int, int]] = []
+    for i in range(n_segments):
+        for k in onboard[i]:
+            # Most-significant digit first: the earliest passenger-major
+            # position outweighs every later digit combined.
+            weight = base ** (n_positions - 1 - position[(k, i)])
+            edge_index = len(graph[seg_node[i]])
+            add_edge(seg_node[i], pax_node[k], segment_costs[i], weight)
+            pair_edges.append((i, edge_index))
+
+    for k in range(m):
+        free_cap = min(baseline_amount[k], cap_amount[k])
+        add_edge(pax_node[k], sink, free_cap, 0)
+        over_cap = cap_amount[k] - free_cap
+        if over_cap > 0:
+            add_edge(pax_node[k], sink, over_cap, primary_unit)
+
+    # Successive shortest augmenting path (Dijkstra with potentials). The
+    # graph starts with non-negative costs, so initial potentials of 0 are
+    # feasible.
+    potential = [0] * (sink + 1)
+    flow = 0
+    INF = None
+    while flow < total_cost:
+        dist = [INF] * (sink + 1)
+        dist[source] = 0
+        prev_v = [-1] * (sink + 1)
+        prev_e = [-1] * (sink + 1)
+        heap = [(0, source)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d != dist[u]:
+                continue
+            for e, edge in enumerate(graph[u]):
+                if edge["cap"] <= 0:
+                    continue
+                nd = d + edge["cost"] + potential[u] - potential[edge["to"]]
+                if dist[edge["to"]] is None or nd < dist[edge["to"]]:
+                    dist[edge["to"]] = nd
+                    prev_v[edge["to"]] = u
+                    prev_e[edge["to"]] = e
+                    heapq.heappush(heap, (nd, edge["to"]))
+        if dist[sink] is None:
+            raise ValueError(
+                "no feasible fare reallocation exists: the on-board "
+                "passengers' budget caps cannot cover the segment costs "
+                "(the maximum chargeable flow falls short of the trip total)"
+            )
+        for v in range(sink + 1):
+            if dist[v] is not None:
+                potential[v] += dist[v]
+        add = total_cost - flow
+        v = sink
+        while v != source:
+            add = min(add, graph[prev_v[v]][prev_e[v]]["cap"])
+            v = prev_v[v]
+        v = sink
+        while v != source:
+            edge = graph[prev_v[v]][prev_e[v]]
+            edge["cap"] -= add
+            graph[v][edge["rev"]]["cap"] += add
+            v = prev_v[v]
+        flow += add
+
+    # Shares are the reverse-arc capacities of the segment -> passenger
+    # edges (their original capacity equals the segment cost).
+    node_to_k = {node: k for k, node in enumerate(pax_node)}
+    shares_by_segment: List[Dict[int, int]] = [
+        {k: 0 for k in onboard[i]} for i in range(n_segments)
+    ]
+    for i, edge_index in pair_edges:
+        edge = graph[seg_node[i]][edge_index]
+        k = node_to_k[edge["to"]]
+        shares_by_segment[i][k] = graph[edge["to"]][edge["rev"]]["cap"]
+
+    totals = {p.id: 0 for p in ordered}
+    details: List[dict] = []
+    for i, cost in enumerate(segment_costs):
+        ids = [ordered[k].id for k in onboard[i]]
+        shares = {ordered[k].id: shares_by_segment[i][k] for k in onboard[i]}
+        for pid, amount in shares.items():
+            totals[pid] += amount
+        details.append({
+            "index": i,
+            "cost": cost,
+            "passengers": ids,
+            "shares": shares,
+        })
+    return totals, details

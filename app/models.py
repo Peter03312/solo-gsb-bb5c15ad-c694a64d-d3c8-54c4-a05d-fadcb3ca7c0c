@@ -195,6 +195,57 @@ class Candidate(Passenger):
     )
 
 
+class BudgetPassenger(Passenger):
+    """A passenger whose total charge must stay within a budget cap."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_fare: NonNegativeInt = Field(
+        description="maximum total amount, in integer cents, the passenger "
+                    "can be charged over the whole trip (a hard cap)"
+    )
+
+
+class BudgetSplitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        max_length=100,
+        description="integer cost of each segment in cents, in travel order",
+    )
+    passengers: List[BudgetPassenger] = Field(
+        min_length=1,
+        max_length=12,
+        description="1 to 12 passengers, each with an id/board/alight ride "
+                    "interval and a non-negative integer max_fare budget cap",
+    )
+
+    @model_validator(mode="after")
+    def _check_budget_trip(self) -> "BudgetSplitRequest":
+        n = len(self.segments)
+        _validate_roster(n, self.passengers)
+        _validate_charged_segments(self.segments, self.passengers)
+        return self
+
+
+class BudgetSplitResponse(BaseModel):
+    total_cost: NonNegativeInt = Field(description="sum of all segment costs in cents")
+    baseline_totals: Dict[str, NonNegativeInt] = Field(
+        description="cents each passenger would pay under the ordinary /split "
+                    "rules (the deviation reference point), in canonical id order"
+    )
+    totals: Dict[str, NonNegativeInt] = Field(
+        description="cents charged to each passenger after the budget-aware "
+                    "reallocation, in canonical id order; sums to total_cost "
+                    "and never exceeds that passenger's cap"
+    )
+    deviation: NonNegativeInt = Field(
+        description="sum of |totals[id] - baseline_totals[id]| over all "
+                    "passengers; minimum among every feasible reallocation"
+    )
+    segments: List[SegmentSplit] = Field(description="per-segment split detail")
+
 class AdmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

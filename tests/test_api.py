@@ -1579,5 +1579,197 @@ class RosterReconstructApiTests(unittest.TestCase):
         )
 
 
+class BudgetSplitApiTests(unittest.TestCase):
+    PAYLOAD = {
+        "segments": [100, 251, 80],
+        "passengers": [
+            {"id": "alice", "board": 0, "alight": 3, "max_fare": 220},
+            {"id": "bob", "board": 1, "alight": 3, "max_fare": 130},
+            {"id": "carol", "board": 0, "alight": 1, "max_fare": 81},
+        ],
+    }
+
+    def test_budget_split_ok(self):
+        resp = client.post("/budget-split", json=self.PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        # /split baseline is alice 216 / bob 165 / carol 50; bob's cap 130
+        # forces -35, absorbed by alice (+4) and carol (+31)
+        self.assertEqual(body["total_cost"], 431)
+        self.assertEqual(body["baseline_totals"],
+                         {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual(body["totals"],
+                         {"alice": 220, "bob": 130, "carol": 81})
+        self.assertEqual(body["deviation"], 70)
+        self.assertEqual(sum(body["totals"].values()), body["total_cost"])
+        for seg, cost in zip(body["segments"], self.PAYLOAD["segments"]):
+            self.assertEqual(seg["cost"], cost)
+            self.assertEqual(sum(seg["shares"].values()), cost)
+            # only on-board passengers are charged
+            self.assertEqual(set(seg["shares"]), set(seg["passengers"]))
+        caps = {p["id"]: p["max_fare"] for p in self.PAYLOAD["passengers"]}
+        for pid, amount in body["totals"].items():
+            self.assertLessEqual(amount, caps[pid])
+
+    def test_generous_caps_keep_baseline_with_zero_deviation(self):
+        payload = {
+            "segments": [100, 251, 80],
+            "passengers": [
+                {"id": "alice", "board": 0, "alight": 3, "max_fare": 10 ** 9},
+                {"id": "bob", "board": 1, "alight": 3, "max_fare": 10 ** 9},
+                {"id": "carol", "board": 0, "alight": 1, "max_fare": 10 ** 9},
+            ],
+        }
+        body = client.post("/budget-split", json=payload).json()
+        split = client.post("/split", json={
+            "segments": payload["segments"],
+            "passengers": [{"id": p["id"], "board": p["board"],
+                            "alight": p["alight"]} for p in payload["passengers"]],
+        }).json()
+        self.assertEqual(body["totals"], split["totals"])
+        self.assertEqual(body["baseline_totals"], split["totals"])
+        self.assertEqual(body["deviation"], 0)
+
+    def test_integer_ids_sort_numerically(self):
+        payload = {
+            "segments": [10],
+            "passengers": [
+                {"id": 10, "board": 0, "alight": 1, "max_fare": 10},
+                {"id": 9, "board": 0, "alight": 1, "max_fare": 10},
+            ],
+        }
+        body = client.post("/budget-split", json=payload).json()
+        self.assertEqual(list(body["totals"]), ["9", "10"])
+        self.assertEqual(body["segments"][0]["passengers"], [9, 10])
+
+    def test_input_order_does_not_matter(self):
+        import random
+        baseline = client.post("/budget-split", json=self.PAYLOAD).json()
+        for seed in range(6):
+            shuffled = {
+                "segments": self.PAYLOAD["segments"],
+                "passengers": self.PAYLOAD["passengers"][:],
+            }
+            random.Random(seed).shuffle(shuffled["passengers"])
+            resp = client.post("/budget-split", json=shuffled)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json(), baseline)
+
+    def test_no_feasible_allocation_is_422(self):
+        # one segment of 100 shared by two riders each capped below 50
+        payload = {
+            "segments": [100],
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "max_fare": 40},
+                {"id": "b", "board": 0, "alight": 1, "max_fare": 40},
+            ],
+        }
+        resp = client.post("/budget-split", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no feasible fare reallocation", resp.text)
+
+    def test_cross_segment_cap_shortfall_is_422(self):
+        # each segment is coverable alone (a could pay 60 on seg0), but a
+        # rides both segments with cap 60 while b can add at most 60:
+        # total capacity 120 < trip cost 120 ... here it binds exactly;
+        # tighten a to 59 so no integer reallocation exists.
+        payload = {
+            "segments": [60, 60],
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2, "max_fare": 59},
+                {"id": "b", "board": 1, "alight": 2, "max_fare": 60},
+            ],
+        }
+        self.assertEqual(client.post("/budget-split", json=payload).status_code, 422)
+
+    def test_trip_validation_rules_still_apply(self):
+        bad_interval = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 1, "alight": 1, "max_fare": 5}],
+        }
+        resp = client.post("/budget-split", json=bad_interval)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("invalid interval", resp.text)
+
+        empty_load = {
+            "segments": [10, 0],
+            "passengers": [{"id": "a", "board": 1, "alight": 2, "max_fare": 50}],
+        }
+        resp = client.post("/budget-split", json=empty_load)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+        out_of_range = {
+            "segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 2, "max_fare": 50}],
+        }
+        self.assertEqual(client.post("/budget-split", json=out_of_range).status_code, 422)
+
+        duplicate = {
+            "segments": [10],
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "max_fare": 5},
+                {"id": "a", "board": 0, "alight": 1, "max_fare": 5},
+            ],
+        }
+        resp = client.post("/budget-split", json=duplicate)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate passenger id", resp.text)
+
+    def test_malformed_requests_are_422(self):
+        cases = [
+            {"segments": [], "passengers": self.PAYLOAD["passengers"]},
+            {"segments": [10], "passengers": []},
+            {"segments": [-5], "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "max_fare": 50}]},
+            {"segments": [10], "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "max_fare": -1}]},
+            {"segments": [10], "passengers": [
+                {"id": "a", "board": 0, "alight": 1, "max_fare": 1.5}]},
+            {"segments": [10]},  # passengers missing
+            dict(self.PAYLOAD, currency="usd"),  # unknown field
+        ]
+        for payload in cases:
+            self.assertEqual(
+                client.post("/budget-split", json=payload).status_code, 422, payload
+            )
+
+    def test_size_limits_are_enforced(self):
+        too_many_segments = {
+            "segments": [1] * 101,
+            "passengers": [{"id": "a", "board": 0, "alight": 101, "max_fare": 1000}],
+        }
+        self.assertEqual(
+            client.post("/budget-split", json=too_many_segments).status_code, 422
+        )
+        too_many_passengers = {
+            "segments": [10],
+            "passengers": [
+                {"id": i, "board": 0, "alight": 1, "max_fare": 100}
+                for i in range(13)
+            ],
+        }
+        self.assertEqual(
+            client.post("/budget-split", json=too_many_passengers).status_code, 422
+        )
+
+    def test_max_limits_are_accepted(self):
+        # 100 segments, 12 passengers with generous caps; feasibility is
+        # guaranteed by one whole-trip anchor passenger.
+        payload = {
+            "segments": [100] * 100,
+            "passengers": [
+                {"id": 0, "board": 0, "alight": 100, "max_fare": 10 ** 9}
+            ] + [
+                {"id": i, "board": i - 1, "alight": i, "max_fare": 10 ** 9}
+                for i in range(1, 12)
+            ],
+        }
+        resp = client.post("/budget-split", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(sum(body["totals"].values()), 10000)
+
+
 if __name__ == "__main__":
     unittest.main()

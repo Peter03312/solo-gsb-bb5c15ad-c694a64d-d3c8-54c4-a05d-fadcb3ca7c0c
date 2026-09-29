@@ -14,6 +14,7 @@ from types import SimpleNamespace as P
 from app.splitter import (
     _triple,
     admit_passengers,
+    budget_split,
     fare_envelope,
     plan_seats,
     reconcile_receipts,
@@ -47,6 +48,10 @@ def receipt(rid, amount, segments):
 
 def candidate_rider(pid, intervals):
     return P(id=pid, candidates=[list(interval) for interval in intervals])
+
+
+def capped(pid, board, alight, max_fare):
+    return P(id=pid, board=board, alight=alight, max_fare=max_fare)
 
 
 class SplitFaresTests(unittest.TestCase):
@@ -1154,6 +1159,199 @@ class ReconstructRosterTests(unittest.TestCase):
                 self.assertEqual(
                     tuple((r.board, r.alight) for r in rides), expected
                 )
+
+
+class BudgetSplitTests(unittest.TestCase):
+    def test_generous_caps_reproduce_baseline_totals(self):
+        # with caps far above every share, the baseline itself is feasible
+        # and has deviation 0; the totals must be exactly the /split totals
+        passengers = [
+            capped("alice", 0, 3, 10 ** 9),
+            capped("bob", 1, 3, 10 ** 9),
+            capped("carol", 0, 1, 10 ** 9),
+        ]
+        segments = [100, 251, 80]
+        totals, details = budget_split(segments, passengers)
+        baseline, _ = split_fares(segments, passengers)
+        self.assertEqual(totals, baseline)
+        self.assertEqual(sum(totals.values()), 431)
+        # per-segment conservation and only-on-board charging still hold
+        for i, d in enumerate(details):
+            self.assertEqual(sum(d["shares"].values()), segments[i])
+            self.assertEqual(set(d["shares"]), set(d["passengers"]))
+
+    def test_caps_are_respected_and_deviation_is_minimal(self):
+        # baseline is alice 216 / bob 165 / carol 50; caps 220 / 130 / 81
+        # force bob down by 35; the other two absorb it within their slack
+        totals, _ = budget_split(
+            [100, 251, 80],
+            [capped("alice", 0, 3, 220), capped("bob", 1, 3, 130),
+             capped("carol", 0, 1, 81)],
+        )
+        self.assertEqual(totals, {"alice": 220, "bob": 130, "carol": 81})
+        baseline = {"alice": 216, "bob": 165, "carol": 50}
+        deviation = sum(abs(totals[p] - baseline[p]) for p in totals)
+        # bob -35 balanced by alice +4 and carol +31 => deviation 70
+        self.assertEqual(deviation, 70)
+
+    def test_infeasible_when_caps_cannot_cover_a_segment(self):
+        with self.assertRaises(ValueError):
+            budget_split(
+                [100],
+                [capped("a", 0, 1, 40), capped("b", 0, 1, 40)],
+            )
+
+    def test_caps_can_cover_each_segment_but_not_globally_is_still_feasible(self):
+        # seg0 a alone costs 60, seg1 a,b cost 60: a pays for both rides,
+        # b only the second. Caps a=60, b=60 work: a=60, b=60.
+        totals, details = budget_split(
+            [60, 60], [capped("a", 0, 2, 60), capped("b", 1, 2, 60)]
+        )
+        self.assertEqual(totals, {"a": 60, "b": 60})
+
+    def test_only_on_board_passengers_are_charged(self):
+        _, details = budget_split(
+            [10, 10], [capped("a", 0, 1, 50), capped("b", 1, 2, 50)]
+        )
+        self.assertEqual(details[0]["shares"], {"a": 10})
+        self.assertEqual(details[1]["shares"], {"b": 10})
+
+    def test_zero_cost_segments_keep_empty_details(self):
+        totals, details = budget_split(
+            [0, 10, 0], [capped("a", 1, 2, 50)]
+        )
+        self.assertEqual(totals, {"a": 10})
+        self.assertEqual(details[0]["passengers"], [])
+        self.assertEqual(details[0]["shares"], {})
+
+    def test_totals_never_exceed_caps(self):
+        rng = random.Random(20260929)
+        for _ in range(200):
+            n_seg = rng.randint(1, 6)
+            passengers = [capped("anchor", 0, n_seg, 10 ** 6)]
+            for i in range(rng.randint(0, 4)):
+                b0 = rng.randint(0, n_seg - 1)
+                passengers.append(
+                    capped(f"p{i}", b0, rng.randint(b0 + 1, n_seg),
+                           rng.randint(0, 500))
+                )
+            segments = [rng.randint(0, 300) for _ in range(n_seg)]
+            try:
+                totals, details = budget_split(segments, passengers)
+            except ValueError:
+                continue
+            for p in passengers:
+                self.assertLessEqual(totals[p.id], p.max_fare)
+            for i, cost in enumerate(segments):
+                self.assertEqual(sum(details[i]["shares"].values()), cost)
+            self.assertEqual(sum(totals.values()), sum(segments))
+
+    def test_matches_brute_force(self):
+        def brute(segment_costs, passengers):
+            ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+            m = len(ordered)
+            onboard = [
+                [k for k, p in enumerate(ordered) if p.board <= i < p.alight]
+                for i in range(len(segment_costs))
+            ]
+            baseline, _ = split_fares(segment_costs, ordered)
+            best = None
+
+            def rec(i, totals, rows):
+                nonlocal best
+                if i == len(segment_costs):
+                    dev = sum(
+                        abs(totals[k] - baseline[ordered[k].id]) for k in range(m)
+                    )
+                    flat = tuple(
+                        rows[j][k] for k, p in enumerate(ordered)
+                        for j in range(p.board, p.alight)
+                    )
+                    key = (dev, flat)
+                    if best is None or key < best[0]:
+                        best = (key, list(totals))
+                    return
+                ks = onboard[i]
+                if not ks:
+                    rows.append([0] * m)
+                    rec(i + 1, totals, rows)
+                    rows.pop()
+                    return
+
+                def comps(pos, left, acc):
+                    if pos == len(ks) - 1:
+                        if totals[ks[pos]] + left <= ordered[ks[pos]].max_fare:
+                            yield acc + [left]
+                        return
+                    upper = min(left,
+                                ordered[ks[pos]].max_fare - totals[ks[pos]])
+                    for x in range(upper + 1):
+                        yield from comps(pos + 1, left - x, acc + [x])
+
+                for vals in comps(0, segment_costs[i], []):
+                    row = [0] * m
+                    for k, v in zip(ks, vals):
+                        totals[k] += v
+                        row[k] = v
+                    rows.append(row)
+                    rec(i + 1, totals, rows)
+                    rows.pop()
+                    for k, v in zip(ks, vals):
+                        totals[k] -= v
+
+            rec(0, [0] * m, [])
+            return best
+
+        rng = random.Random(7719)
+        feasible = 0
+        for _ in range(300):
+            n_seg = rng.randint(1, 4)
+            passengers = []
+            for k in range(rng.randint(1, 4)):
+                b0 = rng.randint(0, n_seg - 1)
+                passengers.append(
+                    capped(k, b0, rng.randint(b0 + 1, n_seg), rng.randint(0, 40))
+                )
+            segments = [rng.randint(0, 30) for _ in range(n_seg)]
+            if any(c > 0 and not any(p.board <= i < p.alight for p in passengers)
+                   for i, c in enumerate(segments)):
+                continue
+            best = brute(segments, passengers)
+            try:
+                totals, details = budget_split(segments, passengers)
+            except ValueError:
+                self.assertIsNone(best, segments)
+                continue
+            self.assertIsNotNone(best, segments)
+            feasible += 1
+            ordered = sorted(passengers, key=lambda p: tie_key(p.id))
+            (exp_dev, exp_flat), exp_totals = best
+            self.assertEqual([totals[p.id] for p in ordered], exp_totals, segments)
+            got_flat = tuple(
+                details[i]["shares"][p.id]
+                for k, p in enumerate(ordered)
+                for i in range(p.board, p.alight)
+            )
+            self.assertEqual(got_flat, exp_flat, segments)
+            baseline, _ = split_fares(segments, ordered)
+            got_dev = sum(
+                abs(totals[ordered[k].id] - baseline[ordered[k].id])
+                for k in range(len(ordered))
+            )
+            self.assertEqual(got_dev, exp_dev)
+        self.assertGreater(feasible, 40)
+
+    def test_input_order_does_not_matter(self):
+        passengers = [
+            capped("a", 0, 3, 220), capped("b", 1, 3, 130),
+            capped(2, 0, 1, 60), capped("c", 0, 2, 90),
+        ]
+        segments = [100, 251, 80]
+        baseline = budget_split(segments, passengers)
+        for seed in range(8):
+            shuffled = passengers[:]
+            random.Random(seed).shuffle(shuffled)
+            self.assertEqual(budget_split(segments, shuffled), baseline)
 
 
 if __name__ == "__main__":
